@@ -72,7 +72,7 @@ async function saveFirebaseProfile(role, publicId, name) {
 // 2. Database & Data Directory Setup
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.VERCEL ? '/tmp' : (process.env.DATA_DIR || path.join(__dirname, 'data'));
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -80,7 +80,6 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const dbPath = path.join(DATA_DIR, 'ecoloop.sqlite');
 let db = null;
-let dbInitPromise = null;
 
 function saveDb() {
   if (db) {
@@ -91,22 +90,8 @@ function saveDb() {
 }
 
 async function initDatabase() {
-  if (db) return db;
   initFirebase();
-
-  // โหลด WASM จาก local node_modules โดยตรง
-  const wasmBinaryPath = path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
-  let sqlConfig = {};
-
-  if (fs.existsSync(wasmBinaryPath)) {
-    const wasmBinary = fs.readFileSync(wasmBinaryPath);
-    sqlConfig = { wasmBinary };
-  } else {
-    sqlConfig = { locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${file}` };
-  }
-
-  const SQL = await initSqlJs(sqlConfig);
-
+  const SQL = await initSqlJs();
   if (fs.existsSync(dbPath)) {
     const filebuffer = fs.readFileSync(dbPath);
     db = new SQL.Database(filebuffer);
@@ -148,24 +133,9 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS tx_merchant_idx ON transactions(merchant_user_id, id DESC);
   `);
   saveDb();
-  return db;
 }
 
-// Lazy-load DB Middleware
-app.use(async (req, res, next) => {
-  try {
-    if (!dbInitPromise) {
-      dbInitPromise = initDatabase();
-    }
-    await dbInitPromise;
-    next();
-  } catch (err) {
-    console.error("Database initialization failed:", err);
-    res.status(500).json({ error: "Internal Server Error: Database init failed" });
-  }
-});
-
-// Helpers
+// Helpers สำหรับ sql.js
 function dbGet(sql, params = []) {
   const stmt = db.prepare(sql);
   stmt.bind(params);
@@ -247,7 +217,7 @@ app.use((req, res, next) => {
 app.post('/api/register', async (req, res) => {
   const { id, password, role, name } = req.body || {};
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 100) return res.status(400).json({ error: role === 'merchant' ? 'กรุณากรอกชื่อร้านค้า 2–100 ตัวอักษร' : 'กรุณากรอกชื่อ-นามสกุล 2–100 ตัวอักษร' });
-  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || password.length < 6 || password.length > 128 || !['student', 'merchant'].includes(role)) {
+  if (!/^\d{5,20}$/.test(String(id || '')) || typeof password !== 'string' || password.length < 6 || password.length > 128 || !['student', 'merchant'].includes(role)) {
     return res.status(400).json({ error: 'กรอกรหัสตัวเลข 5–20 หลัก และรหัสผ่าน 6–128 ตัวอักษร' });
   }
   
@@ -269,7 +239,7 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   const { id, password, role } = req.body || {};
-  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || !['student', 'merchant'].includes(role)) {
+  if (!/^\d{5,20}$/.test(String(id || '')) || typeof password !== 'string' || !['student', 'merchant'].includes(role)) {
     return res.status(400).json({ error: 'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง' });
   }
   
@@ -290,4 +260,93 @@ app.get('/api/me', auth, async (req, res) => res.json({ user: await publicUser(r
 app.post('/api/logout', (req, res) => {
   const token = req.cookies?.[cookieName];
   if (token) dbRun('DELETE FROM sessions WHERE token_hash=?', [hashToken(token)]);
-  res
+  res.clearCookie(cookieName, { path: '/' });
+  res.json({ ok: true });
+});
+
+app.post('/api/codes', auth, requireRole('student'), (req, res) => {
+  dbRun('UPDATE verification_codes SET used_at=? WHERE student_user_id=? AND used_at IS NULL', [Date.now(), req.user.dbId]);
+  let code; 
+  do { 
+    code = String(crypto.randomInt(100000, 1000000)); 
+  } while (dbGet('SELECT 1 FROM verification_codes WHERE code=?', [code]));
+  
+  const expires = Date.now() + 60_000;
+  dbRun('INSERT INTO verification_codes(code,student_user_id,expires_at) VALUES(?,?,?)', [code, req.user.dbId, expires]);
+  res.json({ code, expires_at: new Date(expires).toISOString() });
+});
+
+app.post('/api/codes/lookup', auth, requireRole('merchant'), (req, res) => {
+  const code = String(req.body?.code || '');
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'กรุณากรอกรหัส 6 หลัก' });
+  const row = dbGet(`SELECT v.*,u.public_id AS student_id FROM verification_codes v JOIN users u ON u.id=v.student_user_id WHERE v.code=?`, [code]);
+  if (!row || row.used_at || row.expires_at <= Date.now()) return res.status(404).json({ error: 'ไม่พบรหัส รหัสหมดอายุ หรือถูกใช้ไปแล้ว' });
+  res.json({ student_id: row.student_id });
+});
+
+app.post('/api/codes/confirm', auth, requireRole('merchant'), (req, res) => {
+  const code = String(req.body?.code || '');
+  if (req.body?.observed !== true) return res.status(400).json({ error: 'กรุณายืนยันว่าเห็นการใช้แก้วส่วนตัวจริง' });
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'รหัสไม่ถูกต้อง' });
+  
+  try { 
+    const row = dbGet('SELECT * FROM verification_codes WHERE code=?', [code]);
+    if (!row || row.used_at || row.expires_at <= Date.now()) return res.status(409).json({ error: 'รหัสหมดอายุหรือถูกใช้ไปแล้ว' });
+    
+    dbRun('UPDATE verification_codes SET used_at=? WHERE code=? AND used_at IS NULL AND expires_at>?', [Date.now(), code, Date.now()]);
+    dbRun('INSERT INTO transactions(student_user_id,merchant_user_id) VALUES(?,?)', [row.student_user_id, req.user.dbId]);
+    res.json({ ok: true, points_awarded: 100 }); 
+  } catch (e) {
+    res.status(500).json({ error: 'บันทึกรายการไม่สำเร็จ' });
+  }
+});
+
+app.get('/api/dashboard', auth, async (req, res) => {
+  const profile = await getFirebaseProfile(req.user.role, req.user.id);
+  const displayName = profile?.name || req.user.name || req.user.id;
+  
+  if (req.user.role === 'student') {
+    const tx = dbAll(`SELECT t.id,t.created_at,m.public_id AS merchant_id FROM transactions t JOIN users m ON m.id=t.merchant_user_id WHERE t.student_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
+    const active = dbGet('SELECT code,expires_at FROM verification_codes WHERE student_user_id=? AND used_at IS NULL AND expires_at>? ORDER BY expires_at DESC LIMIT 1', [req.user.dbId, Date.now()]);
+    const cupsRow = dbGet('SELECT COUNT(*) AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
+    const pointsRow = dbGet('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
+    
+    res.json({
+      user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'นักศึกษา' },
+      transactions: tx,
+      stats: { cups: cupsRow ? cupsRow.n : 0, points: pointsRow ? pointsRow.n : 0 },
+      activeCode: active ? { code: active.code, expires_at: new Date(active.expires_at).toISOString() } : null
+    });
+  } else {
+    const tx = dbAll(`SELECT t.id,t.created_at,s.public_id AS student_id FROM transactions t JOIN users s ON s.id=t.student_user_id WHERE t.merchant_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
+    const todayRow = dbGet(`SELECT COUNT(*) AS n FROM transactions WHERE merchant_user_id=? AND date(created_at,'localtime')=date('now','localtime')`, [req.user.dbId]);
+    
+    res.json({ user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'ร้านค้า' }, transactions: tx, stats: { today: todayRow ? todayRow.n : 0 } });
+  }
+});
+
+// 5. Static Files & Frontend Routing
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, './')));
+
+app.get('*', (req, res) => {
+  const publicIndexPath = path.join(__dirname, 'public', 'index.html');
+  const rootIndexPath = path.join(__dirname, 'index.html');
+  
+  if (fs.existsSync(publicIndexPath)) {
+    res.sendFile(publicIndexPath);
+  } else if (fs.existsSync(rootIndexPath)) {
+    res.sendFile(rootIndexPath);
+  } else {
+    res.status(404).send('Index page not found.');
+  }
+});
+
+// 6. Start Server
+initDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`EcoLoop server running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error("Database initialization failed:", err);
+});
