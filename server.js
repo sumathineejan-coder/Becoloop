@@ -69,7 +69,7 @@ async function saveFirebaseProfile(role, publicId, name) {
   return String(name).trim();
 }
 
-// 2. Database & Data Directory Setup ( Vercel Path)
+// 2. Database & Data Directory Setup (Vercel Path Compatible)
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.VERCEL ? '/tmp' : (process.env.DATA_DIR || path.join(__dirname, 'data'));
@@ -93,7 +93,12 @@ function saveDb() {
 async function initDatabase() {
   if (db) return db;
   initFirebase();
-  const SQL = await initSqlJs();
+
+  // กำหนด locateFile ให้ดึง sql-wasm.wasm จาก CDN เพื่อแก้ปัญหาบน Serverless Environment
+  const SQL = await initSqlJs({
+    locateFile: file => `https://sql.js.org/dist/${file}`
+  });
+
   if (fs.existsSync(dbPath)) {
     const filebuffer = fs.readFileSync(dbPath);
     db = new SQL.Database(filebuffer);
@@ -234,7 +239,7 @@ app.use((req, res, next) => {
 app.post('/api/register', async (req, res) => {
   const { id, password, role, name } = req.body || {};
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 100) return res.status(400).json({ error: role === 'merchant' ? 'กรุณากรอกชื่อร้านค้า 2–100 ตัวอักษร' : 'กรุณากรอกชื่อ-นามสกุล 2–100 ตัวอักษร' });
-  if (!/^\d{5,20}$/.test(String(id || '')) || typeof password !== 'string' || password.length < 6 || password.length > 128 || !['student', 'merchant'].includes(role)) {
+  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || password.length < 6 || password.length > 128 || !['student', 'merchant'].includes(role)) {
     return res.status(400).json({ error: 'กรอกรหัสตัวเลข 5–20 หลัก และรหัสผ่าน 6–128 ตัวอักษร' });
   }
   
@@ -256,7 +261,7 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   const { id, password, role } = req.body || {};
-  if (!/^\d{5,20}$/.test(String(id || '')) || typeof password !== 'string' || !['student', 'merchant'].includes(role)) {
+  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || !['student', 'merchant'].includes(role)) {
     return res.status(400).json({ error: 'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง' });
   }
   
@@ -295,7 +300,7 @@ app.post('/api/codes', auth, requireRole('student'), (req, res) => {
 
 app.post('/api/codes/lookup', auth, requireRole('merchant'), (req, res) => {
   const code = String(req.body?.code || '');
-  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'กรุณากรอกรหัส 6 หลัก' });
+  if (!/^\d{6}\$/.test(code)) return res.status(400).json({ error: 'กรุณากรอกรหัส 6 หลัก' });
   const row = dbGet(`SELECT v.*,u.public_id AS student_id FROM verification_codes v JOIN users u ON u.id=v.student_user_id WHERE v.code=?`, [code]);
   if (!row || row.used_at || row.expires_at <= Date.now()) return res.status(404).json({ error: 'ไม่พบรหัส รหัสหมดอายุ หรือถูกใช้ไปแล้ว' });
   res.json({ student_id: row.student_id });
@@ -304,7 +309,7 @@ app.post('/api/codes/lookup', auth, requireRole('merchant'), (req, res) => {
 app.post('/api/codes/confirm', auth, requireRole('merchant'), (req, res) => {
   const code = String(req.body?.code || '');
   if (req.body?.observed !== true) return res.status(400).json({ error: 'กรุณายืนยันว่าเห็นการใช้แก้วส่วนตัวจริง' });
-  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'รหัสไม่ถูกต้อง' });
+  if (!/^\d{6}\$/.test(code)) return res.status(400).json({ error: 'รหัสไม่ถูกต้อง' });
   
   try { 
     const row = dbGet('SELECT * FROM verification_codes WHERE code=?', [code]);
@@ -326,41 +331,4 @@ app.get('/api/dashboard', auth, async (req, res) => {
     const tx = dbAll(`SELECT t.id,t.created_at,m.public_id AS merchant_id FROM transactions t JOIN users m ON m.id=t.merchant_user_id WHERE t.student_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
     const active = dbGet('SELECT code,expires_at FROM verification_codes WHERE student_user_id=? AND used_at IS NULL AND expires_at>? ORDER BY expires_at DESC LIMIT 1', [req.user.dbId, Date.now()]);
     const cupsRow = dbGet('SELECT COUNT(*) AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
-    const pointsRow = dbGet('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
-    
-    res.json({
-      user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'นักศึกษา' },
-      transactions: tx,
-      stats: { cups: cupsRow ? cupsRow.n : 0, points: pointsRow ? pointsRow.n : 0 },
-      activeCode: active ? { code: active.code, expires_at: new Date(active.expires_at).toISOString() } : null
-    });
-  } else {
-    const tx = dbAll(`SELECT t.id,t.created_at,s.public_id AS student_id FROM transactions t JOIN users s ON s.id=t.student_user_id WHERE t.merchant_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
-    const todayRow = dbGet(`SELECT COUNT(*) AS n FROM transactions WHERE merchant_user_id=? AND date(created_at,'localtime')=date('now','localtime')`, [req.user.dbId]);
-    
-    res.json({ user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'ร้านค้า' }, transactions: tx, stats: { today: todayRow ? todayRow.n : 0 } });
-  }
-});
-
-// 5. Static Files & Routing
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.static(path.join(__dirname, './')));
-
-app.get('*', (req, res) => {
-  const publicIndexPath = path.join(__dirname, 'public', 'index.html');
-  const rootIndexPath = path.join(__dirname, 'index.html');
-  
-  if (fs.existsSync(publicIndexPath)) {
-    res.sendFile(publicIndexPath);
-  } else if (fs.existsSync(rootIndexPath)) {
-    res.sendFile(rootIndexPath);
-  } else {
-    res.status(404).send('Index page not found.');
-  }
-});
-
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-  app.listen(PORT, () => console.log(`EcoLoop server running on port ${PORT}`));
-}
-
-module.exports = app;
+    const pointsRow = dbGet('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?', [req.user.db
