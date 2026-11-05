@@ -1,4 +1,10 @@
 {
+  "version": 2,
+  "functions": {
+    "server.js": {
+      "includeFiles": "node_modules/sql.js/dist/sql-wasm.wasm"
+    }
+  },
   "rewrites": [
     {
       "source": "/(.*)",
