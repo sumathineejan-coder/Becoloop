@@ -1,18 +1,111 @@
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const initSqlJs = require('sql.js');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const admin = require('firebase-admin');
+
+// 1. Firebase Admin Initialization
+let firestore = null;
+function initFirebase() {
+  try {
+    let serviceAccount;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH && fs.existsSync(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)) {
+      serviceAccount = require(path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH));
+    } else if (fs.existsSync(path.join(__dirname, 'serviceAccountKey.json'))) {
+      serviceAccount = require(path.join(__dirname, 'serviceAccountKey.json'));
+    }
+
+    if (!serviceAccount) { 
+      console.warn('Firebase profile sync disabled'); 
+      return; 
+    }
+
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
+    firestore = admin.firestore();
+    console.log('Firebase Firestore profile connection ready');
+  } catch (error) {
+    console.error('Firebase initialization failed:', error.message);
+  }
+}
+
+async function getFirebaseProfile(role, publicId) {
+  if (!firestore) return null;
+  try {
+    const candidates = [
+      firestore.collection('users').doc(`${role}_${publicId}`),
+      firestore.collection('users').doc(String(publicId))
+    ];
+    for (const ref of candidates) {
+      const snap = await ref.get();
+      if (snap.exists) {
+        const data = snap.data() || {};
+        if (data.role && data.role !== role) continue;
+        const name = role === 'merchant'
+          ? (data.shopName || data.storeName || data.displayName || data.name || data.fullName)
+          : (data.fullName || data.displayName || data.name || data.studentName);
+        return { name: typeof name === 'string' ? name.trim() : '', role };
+      }
+    }
+  } catch (e) {
+    console.error('getFirebaseProfile error:', e.message);
+  }
+  return null;
+}
+
+async function saveFirebaseProfile(role, publicId, name) {
+  if (!firestore) return String(name).trim();
+  const field = role === 'merchant' ? 'shopName' : 'fullName';
+  await firestore.collection('users').doc(`${role}_${publicId}`).set({
+    publicId: String(publicId), role, [field]: String(name).trim(), updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+  return String(name).trim();
+}
+
+// 2. Database & Data Directory Setup
+const app = express();
+const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.VERCEL ? '/tmp' : (process.env.DATA_DIR || path.join(__dirname, 'data'));
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+const dbPath = path.join(DATA_DIR, 'ecoloop.sqlite');
+let db = null;
+let dbInitPromise = null;
+
+function saveDb() {
+  if (db) {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(dbPath, buffer);
+  }
+}
+
 async function initDatabase() {
   if (db) return db;
   initFirebase();
 
-  // ชี้ไปยังไฟล์ WASM ในโฟลเดอร์ node_modules หรือ public
-  const wasmPath = path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
-  
-  const SQL = await initSqlJs({
-    locateFile: file => {
-      if (file.endsWith('.wasm') && fs.existsSync(wasmPath)) {
-        return wasmPath;
-      }
-      return `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${file}`;
-    }
-  });
+  // โหลด WASM จาก local node_modules โดยตรง
+  const wasmBinaryPath = path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
+  let sqlConfig = {};
+
+  if (fs.existsSync(wasmBinaryPath)) {
+    const wasmBinary = fs.readFileSync(wasmBinaryPath);
+    sqlConfig = { wasmBinary };
+  } else {
+    sqlConfig = { locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${file}` };
+  }
+
+  const SQL = await initSqlJs(sqlConfig);
 
   if (fs.existsSync(dbPath)) {
     const filebuffer = fs.readFileSync(dbPath);
@@ -57,3 +150,144 @@ async function initDatabase() {
   saveDb();
   return db;
 }
+
+// Lazy-load DB Middleware
+app.use(async (req, res, next) => {
+  try {
+    if (!dbInitPromise) {
+      dbInitPromise = initDatabase();
+    }
+    await dbInitPromise;
+    next();
+  } catch (err) {
+    console.error("Database initialization failed:", err);
+    res.status(500).json({ error: "Internal Server Error: Database init failed" });
+  }
+});
+
+// Helpers
+function dbGet(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  if (stmt.step()) {
+    const row = stmt.getAsObject();
+    stmt.free();
+    return row;
+  }
+  stmt.free();
+  return null;
+}
+
+function dbAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const results = [];
+  while (stmt.step()) {
+    results.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return results;
+}
+
+function dbRun(sql, params = []) {
+  db.run(sql, params);
+  saveDb();
+  const res = db.exec("SELECT last_insert_rowid() as id");
+  const lastID = res[0] && res[0].values[0] ? res[0].values[0][0] : 0;
+  return { lastID };
+}
+
+// 3. Middlewares
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: '20kb' }));
+app.use('/api/', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
+
+const cookieName = 'ecoloop_session';
+const hashToken = token => crypto.createHash('sha256').update(token).digest('hex');
+
+function setSession(res, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expires = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  dbRun('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)', [hashToken(token), userId, expires]);
+  res.cookie(cookieName, token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/', maxAge: 7 * 24 * 60 * 60 * 1000 });
+}
+
+function auth(req, res, next) {
+  const token = req.cookies?.[cookieName];
+  if (!token) return res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อน' });
+  
+  const row = dbGet(`SELECT u.id,u.public_id,u.role,u.name,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`, [hashToken(token)]);
+  if (!row || row.expires_at < Date.now()) {
+    if (token) dbRun('DELETE FROM sessions WHERE token_hash=?', [hashToken(token)]);
+    res.clearCookie(cookieName, { path: '/' });
+    return res.status(401).json({ error: 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' });
+  }
+  req.user = { dbId: row.id, id: row.public_id, role: row.role, name: row.name || '' };
+  next();
+}
+
+const requireRole = role => (req, res, next) => req.user.role === role ? next() : res.status(403).json({ error: 'ไม่มีสิทธิ์ใช้งานส่วนนี้' });
+
+async function publicUser(u) {
+  const profile = await getFirebaseProfile(u.role, u.id);
+  const name = profile?.name || u.name || u.id;
+  return { id: u.id, role: u.role, name, profileType: u.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' };
+}
+
+app.use((req, res, next) => {
+  req.cookies = {};
+  (req.headers.cookie || '').split(';').forEach(part => { 
+    const i = part.indexOf('='); 
+    if (i > 0) req.cookies[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); 
+  });
+  next();
+});
+
+// 4. API Endpoints
+app.post('/api/register', async (req, res) => {
+  const { id, password, role, name } = req.body || {};
+  if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 100) return res.status(400).json({ error: role === 'merchant' ? 'กรุณากรอกชื่อร้านค้า 2–100 ตัวอักษร' : 'กรุณากรอกชื่อ-นามสกุล 2–100 ตัวอักษร' });
+  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || password.length < 6 || password.length > 128 || !['student', 'merchant'].includes(role)) {
+    return res.status(400).json({ error: 'กรอกรหัสตัวเลข 5–20 หลัก และรหัสผ่าน 6–128 ตัวอักษร' });
+  }
+  
+  let lastID;
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    const result = dbRun('INSERT INTO users(public_id,role,password_hash,name) VALUES(?,?,?,?)', [String(id), role, hash, String(name).trim()]);
+    lastID = result.lastID;
+
+    const savedName = await saveFirebaseProfile(role, String(id), name);
+    setSession(res, lastID);
+    res.json({ user: { id: String(id), role, name: savedName, profileType: role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
+  } catch (e) { 
+    if (lastID) dbRun('DELETE FROM users WHERE id=?', [lastID]);
+    if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'รหัสนี้สมัครบัญชีประเภทนี้ไว้แล้ว กรุณาเข้าสู่ระบบ' }); 
+    res.status(500).json({ error: 'ไม่สามารถสร้างบัญชีได้' }); 
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { id, password, role } = req.body || {};
+  if (!/^\d{5,20}\$/.test(String(id || '')) || typeof password !== 'string' || !['student', 'merchant'].includes(role)) {
+    return res.status(400).json({ error: 'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง' });
+  }
+  
+  const row = dbGet('SELECT * FROM users WHERE public_id=? AND role=?', [String(id), role]);
+  if (!row || !(await bcrypt.compare(password, row.password_hash))) {
+    return res.status(401).json({ error: 'ไม่พบบัญชีหรือรหัสผ่านไม่ถูกต้อง หากยังไม่มีบัญชีให้กดสมัครบัญชีใหม่' });
+  }
+  
+  const profile = await getFirebaseProfile(row.role, row.public_id);
+  const displayName = profile?.name || row.name || row.public_id;
+  
+  setSession(res, row.id);
+  res.json({ user: { id: row.public_id, role: row.role, name: displayName, profileType: row.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
+});
+
+app.get('/api/me', auth, async (req, res) => res.json({ user: await publicUser(req.user) }));
+
+app.post('/api/logout', (req, res) => {
+  const token = req.cookies?.[cookieName];
+  if (token) dbRun('DELETE FROM sessions WHERE token_hash=?', [hashToken(token)]);
+  res
