@@ -7,6 +7,8 @@ const initSqlJs = require('sql.js');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const admin = require('firebase-admin');
+const SUPABASE_URL = 'https://dmwgphdcrwexzzckurgc.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_qemwMhixfOXKYyAfgufQnw_8EI_atHy';
 
 // 1. Firebase Admin Initialization
 let firestore = null;
