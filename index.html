@@ -16,16 +16,7 @@ input,select{display:block;width:100%;border:1px solid #c9d8bf;border-radius:12p
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   const SUPABASE_URL = 'https://dmwgphdcrwexzzckurgc.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_qemwMhixfOXKYyAfgufQnw_8EI_atHy';
-  const { data: users, error } = await supabase.from('users').select('*');
-  // 1. เพิ่ม transaction
-await supabase.from('transactions').insert([
-  { user_id: currentUser.id, amount: 50, status: 'confirmed' }
-]);
-
-// 2. บวก 100 คะแนนให้ user
-await supabase.from('users').update({ 
-  points: currentUser.points + 100 
-}).eq('id', currentUser.id);
+ 
 
 const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 </head><body><header><button id="brandHome" class="brand" type="button" aria-label="กลับหน้าหลัก" style="background:transparent;border:0;box-shadow:none;padding:0;color:var(--deep);cursor:pointer"><span class="brand-mark">🌱</span>Eco<span>Loop</span></button><nav class="nav"><a href="#home">หน้าหลัก</a><a href="#features">คุณสมบัติ</a><a href="#about">เกี่ยวกับโครงการ</a></nav><div class="head-actions"><button id="headerLogin" class="btn alt" type="button">เข้าสู่ระบบ</button><button id="headerRegister" class="btn" type="button">สมัครสมาชิก</button><span id="headerUser" class="account-name hidden"></span><button id="dashboardHome" class="btn light hidden" type="button">หน้าหลัก</button><button id="logout" class="btn alt hidden" type="button">ออกจากระบบ</button></div></header><main>
